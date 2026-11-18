@@ -96,6 +96,8 @@ end
 -- Bits of $flags (MATERIAL_VAR_ADDITIVE = 1 << 7, MATERIAL_VAR_TRANSLUCENT = 1 << 21)
 local MATERIAL_VAR_ADDITIVE_BIT = 0x80
 local MATERIAL_VAR_TRANSLUCENT_BIT = 0x200000
+local MATERIAL_VAR_VERTEXALPHA_BIT = 0x20
+local MATERIAL_VAR_ALPHATEST_BIT = 0x100
 
 ---Does the material blend with what is behind it ($translucent or $additive)? Those must not write depth when drawn:
 ---a window would otherwise cut out everything behind it that is drawn later. Alpha tested materials (fences, leaves)
@@ -106,6 +108,16 @@ local function blendsWithBackground( material )
 	-- $translucent and $additive are material flags: they are in $flags, and $translucent isn't always readable by name
 	local flags = material:GetInt( "$flags" ) or 0
 	if bit.band( flags, MATERIAL_VAR_TRANSLUCENT_BIT + MATERIAL_VAR_ADDITIVE_BIT ) ~= 0 then return true end
+	if bit.band( flags, MATERIAL_VAR_VERTEXALPHA_BIT + MATERIAL_VAR_ALPHATEST_BIT ) == MATERIAL_VAR_VERTEXALPHA_BIT then
+		local shader = material:GetShader():gsub( "_DX%d+$", "" )
+		if shader == "LightmappedGeneric" or shader == "UnlitGeneric" then return true end
+		-- Single-texture transitions can use displacement alpha as opacity.
+		-- A second texture uses that same channel as its blend weight.
+		if shader == "WorldVertexTransition" then
+			local second = material:GetTexture( "$basetexture2" )
+			if not second or second:IsError() or second:GetName() == "error" then return true end
+		end
+	end
 	return ( material:GetInt( "$translucent" ) or 0 ) ~= 0 or ( material:GetInt( "$additive" ) or 0 ) ~= 0
 end
 
@@ -123,15 +135,16 @@ local function buildChunks( material, verts, colors, out, us, vs, translucent, d
 end
 
 ---Creates a new MeshBuilder.
+---@param bounds boolean? # Accumulate triangle bounds while adding faces. Default false.
 ---@return MeshBuilder
-local function create()
-	return ( setmetatable( { _batches = {}, _lightVerts = {}, _lightColors = {}, _lightVertsT = {}, _lightColorsT = {} }, builder_meta ) )
+local function create( bounds )
+	return ( setmetatable( { _trackBounds = bounds, _batches = {}, _lightVerts = {}, _lightColors = {}, _lightVertsT = {}, _lightColorsT = {} }, builder_meta ) )
 end
 
 --- Creates a new MeshBuilder. Client only.
---- @overload fun(): MeshBuilder
+--- @overload fun(bounds: boolean?): MeshBuilder
 NikNaks.MeshBuilder = setmetatable( { Create = create, BlendsWithBackground = blendsWithBackground }, {
-	__call = function() return create() end
+	__call = function( _, bounds ) return create( bounds ) end
 } )
 
 ---@class MeshBuilderOptions
@@ -161,7 +174,24 @@ function builder_meta:AddFace( face, options )
 	end
 
 	local list, n = batch.verts, batch.n
-	for i = 1, #verts do list[n + i] = verts[i] end
+	local minX, minY, minZ = self._minX or math.huge, self._minY or math.huge, self._minZ or math.huge
+	local maxX, maxY, maxZ = self._maxX or -math.huge, self._maxY or -math.huge, self._maxZ or -math.huge
+	for i = 1, #verts do
+		local vertex = verts[i]
+		list[n + i] = vertex
+		if self._trackBounds then
+			local p = vertex.pos
+			local x, y, z = p.x, p.y, p.z
+			if x ~= x or y ~= y or z ~= z or math.abs( x ) == math.huge
+				or math.abs( y ) == math.huge or math.abs( z ) == math.huge then self._invalidBounds = true end
+			minX, minY, minZ = math.min( minX, x ), math.min( minY, y ), math.min( minZ, z )
+			maxX, maxY, maxZ = math.max( maxX, x ), math.max( maxY, y ), math.max( maxZ, z )
+		end
+	end
+	if self._trackBounds then
+		self._minX, self._minY, self._minZ = minX, minY, minZ
+		self._maxX, self._maxY, self._maxZ = maxX, maxY, maxZ
+	end
 
 	-- A displacement with a material that blends textures: the weights are in the color of its vertices, where the
 	-- shader of the material reads them
@@ -170,7 +200,8 @@ function builder_meta:AddFace( face, options )
 	local blends = blendsTextures( material )
 	local blend = blends and face:IsDisplacement()
 	local flat = ( blends and string.gsub( material:GetShader(), "_DX%d+$", "" ) == "WorldVertexTransition" ) and FLAT_BLEND or color_white
-	if blends or batch.colors then
+	local vertexAlpha = bit.band( material:GetInt( "$flags" ) or 0, MATERIAL_VAR_VERTEXALPHA_BIT ) ~= 0
+	if blends or vertexAlpha or batch.colors then
 		local colors = batch.colors
 		if not colors then
 			colors = {}
@@ -179,7 +210,7 @@ function builder_meta:AddFace( face, options )
 		end
 
 		for i = 1, #verts do
-			colors[n + i] = blend and verts[i].color or flat
+			colors[n + i] = ( blend or vertexAlpha ) and verts[i].color or flat
 		end
 	end
 	-- Own lightmap coordinates. The vertices are the face's cache and are not changed: the numbers are kept beside them.
@@ -234,10 +265,27 @@ function builder_meta:AddFaces( faces, options )
 	return added
 end
 
+---Returns the accumulated triangle bounds, or nil when disabled, empty or invalid.
+---Shader deformation is not included. Enable accumulation with MeshBuilder( true ).
+---@return Vector? mins
+---@return Vector? maxs
+function builder_meta:GetBounds()
+	if not self._trackBounds or not self._minX or self._invalidBounds then return nil end
+	return Vector( self._minX, self._minY, self._minZ ), Vector( self._maxX, self._maxY, self._maxZ )
+end
+
+---Returns the triangle bounds retained when the mesh was built, if requested.
+---@return Vector? mins
+---@return Vector? maxs
+function object_meta:GetBounds()
+	return self._mins, self._maxs
+end
+
 ---Compiles everything added so far into meshes. The builder is empty again afterwards.
 ---@return MeshObject
 function builder_meta:Build()
-	local object = setmetatable( { _meshes = {}, _lightMeshes = {}, _triangles = 0 }, object_meta )
+	local mins, maxs = self:GetBounds()
+	local object = setmetatable( { _meshes = {}, _lightMeshes = {}, _triangles = 0, _mins = mins, _maxs = maxs }, object_meta )
 
 	for _, batch in pairs( self._batches ) do
 		buildChunks( batch.material, batch.verts, batch.colors, object._meshes, batch.us, batch.vs, nil, batch.dus, batch.dvs )
@@ -248,6 +296,7 @@ function builder_meta:Build()
 	buildChunks( colorMaterial, self._lightVertsT, self._lightColorsT, object._lightMeshes, nil, nil, true )
 
 	self._batches, self._lightVerts, self._lightColors, self._lightVertsT, self._lightColorsT = {}, {}, {}, {}, {}
+	self._minX, self._minY, self._minZ, self._maxX, self._maxY, self._maxZ, self._invalidBounds = nil, nil, nil, nil, nil, nil, nil
 	return object
 end
 
@@ -279,7 +328,7 @@ local function drawPass( self, translucent, options )
 		for i = 1, #meshes do
 			local m = meshes[i]
 			if m.translucent == translucent then
-				render.SetMaterial( options.material and options.material(m.material) or m.material )
+				render.SetMaterial( options.material and options.material( m.material ) or m.material )
 				m.mesh:Draw()
 			end
 		end
@@ -290,7 +339,7 @@ local function drawPass( self, translucent, options )
 		for i = 1, #meshes do
 			local m = meshes[i]
 			if m.translucent == translucent then
-				render.SetMaterial( options.material and options.material(m.material) or m.material )
+				render.SetMaterial( options.material and options.material( m.material ) or m.material )
 				m.mesh:Draw()
 			end
 		end
